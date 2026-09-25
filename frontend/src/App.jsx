@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import './index.css';
 
-// Keyword dictionaries for pattern matching
+// Local Fallback Keyword dictionaries
 const PATTERNS = {
   urgency: {
     words: ['emergency', 'immediately', 'now', 'hospital', 'urgent', 'quick', 'hurry', 'dying'],
@@ -50,16 +50,21 @@ const PRESETS = {
   ]
 };
 
+const API_URL = "http://localhost:8000/score-message"; // Update to Render URL later
+
 function App() {
   const [messages, setMessages] = useState([]);
   const [riskScore, setRiskScore] = useState(0);
-  const [displayedScore, setDisplayedScore] = useState(0); // For smooth animation
+  const [displayedScore, setDisplayedScore] = useState(0);
   const [activeSignals, setActiveSignals] = useState([]);
-  const [overrideStatus, setOverrideStatus] = useState('active'); // active, approved, locked, error
+  const [overrideStatus, setOverrideStatus] = useState('active');
   const [customInput, setCustomInput] = useState('');
   
   const chatEndRef = useRef(null);
   const scoreAnimationRef = useRef(null);
+  
+  // Keep track of messages internally without re-renders for the API call
+  const messagesRef = useRef([]);
 
   // Smooth score animation
   useEffect(() => {
@@ -74,9 +79,9 @@ function App() {
 
   // Lock override if risk crosses threshold
   useEffect(() => {
-    if (riskScore >= 80 && overrideStatus !== 'locked') {
+    if (riskScore >= 75 && overrideStatus !== 'locked') {
       setOverrideStatus('locked');
-    } else if (riskScore < 80 && overrideStatus === 'locked') {
+    } else if (riskScore < 75 && overrideStatus === 'locked') {
       setOverrideStatus('active');
     }
   }, [riskScore, overrideStatus]);
@@ -86,7 +91,8 @@ function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  const analyzeMessage = (text) => {
+  // Fallback Logic if API fails
+  const analyzeMessageFallback = (text) => {
     const lowerText = text.toLowerCase();
     let scoreIncrease = 0;
     const newSignals = [];
@@ -102,7 +108,22 @@ function App() {
     return { scoreIncrease, newSignals };
   };
 
-  const addMessage = (sender, text) => {
+  const updateSignalsFromStrings = (signalStrings) => {
+    setActiveSignals(prev => {
+      const combined = [...prev];
+      signalStrings.forEach(sigString => {
+        if (!combined.find(s => s.text === sigString)) {
+          // find matching color based on string content
+          let color = 'var(--accent-red)';
+          if (sigString.includes("refusal")) color = 'var(--accent-amber)';
+          combined.push({ text: sigString, color });
+        }
+      });
+      return combined;
+    });
+  };
+
+  const addMessage = async (sender, text) => {
     const newMsg = {
       sender,
       text,
@@ -110,22 +131,44 @@ function App() {
     };
     
     setMessages(prev => [...prev, newMsg]);
-
+    
     if (sender === 'customer') {
-      const analysis = analyzeMessage(text);
-      if (analysis.scoreIncrease > 0) {
-        setRiskScore(prev => Math.min(100, prev + analysis.scoreIncrease));
-        
-        setActiveSignals(prev => {
-          const combined = [...prev];
-          analysis.newSignals.forEach(signal => {
-            if (!combined.find(s => s.id === signal.id)) {
-              combined.push(signal);
-            }
-          });
-          return combined;
+      const currentHistory = [...messagesRef.current];
+      messagesRef.current = [...messagesRef.current, newMsg]; // add new msg to history ref for next time
+      
+      try {
+        const response = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            message: text,
+            conversation_history: currentHistory
+          })
         });
+        
+        if (!response.ok) throw new Error("API call failed");
+        
+        const data = await response.json();
+        setRiskScore(data.risk_score);
+        updateSignalsFromStrings(data.signals_detected);
+        
+      } catch (error) {
+        console.warn("Backend API failed, falling back to local script:", error);
+        // Fallback execution
+        const analysis = analyzeMessageFallback(text);
+        if (analysis.scoreIncrease > 0) {
+          setRiskScore(prev => Math.min(100, prev + analysis.scoreIncrease));
+          setActiveSignals(prev => {
+            const combined = [...prev];
+            analysis.newSignals.forEach(signal => {
+              if (!combined.find(s => s.id === signal.id)) combined.push(signal);
+            });
+            return combined;
+          });
+        }
       }
+    } else {
+      messagesRef.current = [...messagesRef.current, newMsg];
     }
   };
 
@@ -134,7 +177,7 @@ function App() {
     if (!sequence) return;
     
     for (const msg of sequence) {
-      addMessage(msg.sender, msg.text);
+      await addMessage(msg.sender, msg.text);
       // Wait a bit before next message for effect
       await new Promise(r => setTimeout(r, 1000));
     }
@@ -165,6 +208,7 @@ function App() {
 
   const handleReset = () => {
     setMessages([]);
+    messagesRef.current = [];
     setRiskScore(0);
     setDisplayedScore(0);
     setActiveSignals([]);
@@ -172,9 +216,9 @@ function App() {
   };
 
   const getRiskColor = (score) => {
-    if (score < 30) return 'var(--accent-green)';
-    if (score < 70) return 'var(--accent-amber)';
-    return 'var(--accent-red)';
+    if (score < 40) return 'var(--accent-green)'; // Allow
+    if (score < 75) return 'var(--accent-amber)'; // Nudge
+    return 'var(--accent-red)';                   // Block
   };
 
   return (
