@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef } from 'react';
 import { BrowserRouter, Routes, Route, Link, useParams } from 'react-router-dom';
 import './index.css';
 
-const API_URL = "http://localhost:8000";
-const WS_URL = "ws://localhost:8000";
+const IS_PROD = window.location.hostname !== 'localhost';
+const API_URL = IS_PROD ? "https://your-render-backend-url.onrender.com" : "http://localhost:8000";
+const WS_URL = IS_PROD ? "wss://your-render-backend-url.onrender.com" : "ws://localhost:8000";
 
 const PRESETS = {
   normal: [
