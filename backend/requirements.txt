@@ -2,6 +2,5 @@ fastapi
 uvicorn
 pydantic
 sqlalchemy
-asyncpg
-redis
+aiosqlite
 websockets

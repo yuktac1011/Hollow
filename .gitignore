@@ -44,3 +44,4 @@ backend/.mypy_cache/
 *.njsproj
 *.sln
 *.sw?
+backend/*.db

@@ -1,28 +1,38 @@
 import json
 import asyncio
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import redis.asyncio as aioredis
 
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey
+from sqlalchemy import Column, String, Integer, DateTime, JSON, ForeignKey, select
 
 import os
 
 # =======================
 # CONFIGURATION
 # =======================
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost/hollow")
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+# Use local SQLite instead of Postgres to avoid network/docker dependencies
+DATABASE_URL = "sqlite+aiosqlite:///./hollow_local.db"
 
 engine = create_async_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 Base = declarative_base()
+
+# =======================
+# IN-MEMORY STATE (Mock Redis)
+# =======================
+# Dictionary to hold running scores and signals instead of Redis
+app_state: Dict[str, Dict[str, Any]] = {}
+
+def get_state(conversation_id: str):
+    if conversation_id not in app_state:
+        app_state[conversation_id] = {"score": 0, "signals": set()}
+    return app_state[conversation_id]
 
 # =======================
 # DATABASE MODELS
@@ -65,8 +75,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
-
 class ConnectionManager:
     def __init__(self):
         self.active_connections: dict[str, List[WebSocket]] = {}
@@ -90,9 +98,6 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 
-# =======================
-# SCHEMAS
-# =======================
 class MessageInput(BaseModel):
     conversation_id: str
     message: str
@@ -162,28 +167,20 @@ async def score_message(data: MessageInput):
             score_bump += 15
             signals_detected.append("Emotional pressure detected")
 
-        # 4. State Management (Redis)
-        score_key = f"risk_score:{data.conversation_id}"
-        signals_key = f"risk_signals:{data.conversation_id}"
-        
-        current_score = int(await redis_client.get(score_key) or 0)
+        # 4. State Management (In-Memory Fallback)
+        state = get_state(data.conversation_id)
+        current_score = state["score"]
         
         if score_bump > 0:
             new_score = min(current_score + score_bump, 100)
-            await redis_client.setex(score_key, 3600, new_score)
-            
-            # Store unique signals
-            existing_signals = await redis_client.smembers(signals_key)
+            state["score"] = new_score
             for s in signals_detected:
-                if s not in existing_signals:
-                    await redis_client.sadd(signals_key, s)
-            await redis_client.expire(signals_key, 3600)
+                state["signals"].add(s)
         else:
-            # Decay score if no new signals
             new_score = max(current_score - 5, 0)
-            await redis_client.setex(score_key, 3600, new_score)
+            state["score"] = new_score
 
-        all_signals = list(await redis_client.smembers(signals_key))
+        all_signals = list(state["signals"])
 
         # 5. Determine Action
         action = "allow"
@@ -219,17 +216,14 @@ async def score_message(data: MessageInput):
 
         return response_payload
 
-from sqlalchemy import select
 
 @app.get("/conversation/{conversation_id}/history")
 async def get_history(conversation_id: str):
     async with SessionLocal() as db:
-        # Get messages
         stmt = select(Message).where(Message.conversation_id == conversation_id).order_by(Message.timestamp)
         result = await db.execute(stmt)
         messages = result.scalars().all()
         
-        # Get risk events
         stmt_risk = select(RiskEvent).where(RiskEvent.conversation_id == conversation_id).order_by(RiskEvent.timestamp)
         result_risk = await db.execute(stmt_risk)
         risk_events = result_risk.scalars().all()

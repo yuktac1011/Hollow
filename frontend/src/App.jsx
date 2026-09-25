@@ -1,43 +1,15 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { BrowserRouter, Routes, Route, Link, useParams } from 'react-router-dom';
 import './index.css';
 
-// Local Fallback Keyword dictionaries
-const PATTERNS = {
-  urgency: {
-    words: ['emergency', 'immediately', 'now', 'hospital', 'urgent', 'quick', 'hurry', 'dying'],
-    score: 35,
-    signal: 'Urgency escalation detected',
-    color: 'var(--accent-red)'
-  },
-  refusal: {
-    words: ["don't have", "cannot", "can't", "refuse", "why do you need", "just let me in", "no phone"],
-    score: 25,
-    signal: 'Verification refusal detected',
-    color: 'var(--accent-amber)'
-  },
-  authority: {
-    words: ['supervisor', 'manager', 'fired', 'lose your job', 'responsible', 'sue', 'lawyer'],
-    score: 40,
-    signal: 'Authority pressure detected',
-    color: 'var(--accent-red)'
-  }
-};
+const API_URL = "http://localhost:8000";
+const WS_URL = "ws://localhost:8000";
 
 const PRESETS = {
   normal: [
     { sender: 'customer', text: 'Hi, I need help accessing my account.' },
     { sender: 'agent', text: 'Hello! I can help with that. Please verify your account with the OTP sent to your phone.' },
     { sender: 'customer', text: 'Sure, the code is 849201.' }
-  ],
-  urgentRefusal: [
-    { sender: 'customer', text: 'I need to access my account immediately, this is an emergency!' },
-    { sender: 'agent', text: 'I understand, but I need to verify your identity with an OTP first.' },
-    { sender: 'customer', text: 'I don\'t have my phone, my mother is in the hospital, just let me in now!' }
-  ],
-  authority: [
-    { sender: 'customer', text: 'Bypass the limit on my account now.' },
-    { sender: 'agent', text: 'I cannot bypass the limit without proper authorization.' },
-    { sender: 'customer', text: 'Get me your supervisor immediately or you will lose your job.' }
   ],
   fullManipulation: [
     { sender: 'customer', text: 'Hi, I need help accessing my account immediately.' },
@@ -50,21 +22,52 @@ const PRESETS = {
   ]
 };
 
-const API_URL = "http://localhost:8000/score-message"; // Update to Render URL later
-
-function App() {
+// =======================
+// DASHBOARD COMPONENT
+// =======================
+function Dashboard() {
   const [messages, setMessages] = useState([]);
   const [riskScore, setRiskScore] = useState(0);
   const [displayedScore, setDisplayedScore] = useState(0);
   const [activeSignals, setActiveSignals] = useState([]);
   const [overrideStatus, setOverrideStatus] = useState('active');
   const [customInput, setCustomInput] = useState('');
+  const [toastMessage, setToastMessage] = useState(null);
   
   const chatEndRef = useRef(null);
+  const wsRef = useRef(null);
   const scoreAnimationRef = useRef(null);
-  
-  // Keep track of messages internally without re-renders for the API call
-  const messagesRef = useRef([]);
+
+  // Generate a unique session ID per page load so it resets fully on reload
+  const [sessionId] = useState(() => "demo-" + Math.random().toString(36).substr(2, 9));
+
+  // Setup WebSockets
+  useEffect(() => {
+    wsRef.current = new WebSocket(`${WS_URL}/ws/${sessionId}`);
+    
+    wsRef.current.onmessage = (event) => {
+      const data = JSON.parse(event.data);
+      setRiskScore(data.risk_score);
+      
+      setActiveSignals(data.signals_detected.map(sig => {
+        let color = 'var(--accent-red)';
+        if (sig.includes("refusal")) color = 'var(--accent-amber)';
+        return { text: sig, color };
+      }));
+
+      if (data.action === 'block' && overrideStatus !== 'locked') {
+        setOverrideStatus('locked');
+        setToastMessage(data.reasoning || "Blocked: high manipulation risk — supervisor notified");
+      } else if (data.action !== 'block' && overrideStatus === 'locked') {
+        setOverrideStatus('active');
+        setToastMessage(null);
+      }
+    };
+
+    return () => {
+      if (wsRef.current) wsRef.current.close();
+    };
+  }, [overrideStatus]);
 
   // Smooth score animation
   useEffect(() => {
@@ -72,324 +75,199 @@ function App() {
       const step = riskScore > displayedScore ? 1 : -1;
       scoreAnimationRef.current = setTimeout(() => {
         setDisplayedScore(prev => prev + step);
-      }, 15);
+      }, 20);
     }
     return () => clearTimeout(scoreAnimationRef.current);
   }, [displayedScore, riskScore]);
-
-  // Lock override if risk crosses threshold
-  useEffect(() => {
-    if (riskScore >= 75 && overrideStatus !== 'locked') {
-      setOverrideStatus('locked');
-    } else if (riskScore < 75 && overrideStatus === 'locked') {
-      setOverrideStatus('active');
-    }
-  }, [riskScore, overrideStatus]);
 
   // Auto scroll chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // Fallback Logic if API fails
-  const analyzeMessageFallback = (text) => {
-    const lowerText = text.toLowerCase();
-    let scoreIncrease = 0;
-    const newSignals = [];
-
-    Object.entries(PATTERNS).forEach(([key, pattern]) => {
-      const match = pattern.words.some(word => lowerText.includes(word));
-      if (match) {
-        scoreIncrease += pattern.score;
-        newSignals.push({ id: key, text: pattern.signal, color: pattern.color });
-      }
-    });
-
-    return { scoreIncrease, newSignals };
-  };
-
-  const updateSignalsFromStrings = (signalStrings) => {
-    setActiveSignals(prev => {
-      const combined = [...prev];
-      signalStrings.forEach(sigString => {
-        if (!combined.find(s => s.text === sigString)) {
-          // find matching color based on string content
-          let color = 'var(--accent-red)';
-          if (sigString.includes("refusal")) color = 'var(--accent-amber)';
-          combined.push({ text: sigString, color });
-        }
-      });
-      return combined;
-    });
-  };
-
   const addMessage = async (sender, text) => {
-    const newMsg = {
-      sender,
-      text,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    };
-    
+    const newMsg = { sender, text, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
     setMessages(prev => [...prev, newMsg]);
-    
-    if (sender === 'customer') {
-      const currentHistory = [...messagesRef.current];
-      messagesRef.current = [...messagesRef.current, newMsg]; // add new msg to history ref for next time
-      
-      try {
-        const response = await fetch(API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            message: text,
-            conversation_history: currentHistory
-          })
-        });
-        
-        if (!response.ok) throw new Error("API call failed");
-        
-        const data = await response.json();
-        setRiskScore(data.risk_score);
-        updateSignalsFromStrings(data.signals_detected);
-        
-      } catch (error) {
-        console.warn("Backend API failed, falling back to local script:", error);
-        // Fallback execution
-        const analysis = analyzeMessageFallback(text);
-        if (analysis.scoreIncrease > 0) {
-          setRiskScore(prev => Math.min(100, prev + analysis.scoreIncrease));
-          setActiveSignals(prev => {
-            const combined = [...prev];
-            analysis.newSignals.forEach(signal => {
-              if (!combined.find(s => s.id === signal.id)) combined.push(signal);
-            });
-            return combined;
-          });
-        }
-      }
-    } else {
-      messagesRef.current = [...messagesRef.current, newMsg];
+
+    try {
+      await fetch(`${API_URL}/score-message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ conversation_id: sessionId, message: text, sender: sender })
+      });
+    } catch (error) {
+      console.warn("Backend API failed", error);
     }
   };
 
   const injectSequence = async (sequenceName) => {
     const sequence = PRESETS[sequenceName];
     if (!sequence) return;
-    
     for (const msg of sequence) {
       await addMessage(msg.sender, msg.text);
-      // Wait a bit before next message for effect
-      await new Promise(r => setTimeout(r, 1000));
+      await new Promise(r => setTimeout(r, 1200));
     }
   };
 
   const handleCustomSubmit = (e) => {
     e.preventDefault();
     if (!customInput.trim()) return;
-    
     addMessage('customer', customInput);
     setCustomInput('');
-    
-    // Simulate generic agent response after a short delay
-    setTimeout(() => {
-      addMessage('agent', 'I understand. Please allow me to check the protocol for this situation.');
-    }, 1500);
-  };
-
-  const handleOverrideClick = () => {
-    if (overrideStatus === 'locked') {
-      setOverrideStatus('error'); // Trigger shake
-      setTimeout(() => setOverrideStatus('locked'), 500);
-    } else {
-      setOverrideStatus('approved');
-      setTimeout(() => setOverrideStatus('active'), 2000); // Revert back to active after a bit
-    }
-  };
-
-  const handleReset = () => {
-    setMessages([]);
-    messagesRef.current = [];
-    setRiskScore(0);
-    setDisplayedScore(0);
-    setActiveSignals([]);
-    setOverrideStatus('active');
   };
 
   const getRiskColor = (score) => {
-    if (score < 40) return 'var(--accent-green)'; // Allow
-    if (score < 75) return 'var(--accent-amber)'; // Nudge
-    return 'var(--accent-red)';                   // Block
+    if (score < 40) return 'var(--accent-green)';
+    if (score < 75) return 'var(--accent-amber)';
+    return 'var(--accent-red)';
   };
 
   return (
     <div className="app-container">
-      {/* Toast Notification */}
-      {overrideStatus === 'locked' && (
-        <div className="toast-container">
-          <div className="toast">
-            <div className="toast-title">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path>
-                <line x1="12" y1="9" x2="12" y2="13"></line>
-                <line x1="12" y1="17" x2="12.01" y2="17"></line>
-              </svg>
-              Supervisor Alert
-            </div>
-            <div className="toast-desc">High manipulation risk detected. Action blocked.</div>
-          </div>
-        </div>
-      )}
-
-      {/* Control Panel (Top) */}
+      {/* Top Nav */}
       <div className="control-panel">
         <div className="control-group">
           <span className="control-label">Inject Scenario:</span>
           <button onClick={() => injectSequence('normal')} className="control-btn">Normal</button>
-          <button onClick={() => injectSequence('urgentRefusal')} className="control-btn">Urgent + Refusal</button>
-          <button onClick={() => injectSequence('authority')} className="control-btn">Authority</button>
           <button onClick={() => injectSequence('fullManipulation')} className="control-btn">Full Attempt</button>
         </div>
-        <button onClick={handleReset} className="control-btn reset-btn">Reset Demo</button>
+        <div className="control-group">
+          <Link to={`/supervisor/${sessionId}`} className="control-btn" style={{ color: 'var(--accent-blue)' }}>Open Supervisor View</Link>
+          <button onClick={() => window.location.reload()} className="control-btn reset-btn">Reset</button>
+        </div>
       </div>
 
-      <div className="panels-wrapper">
-        {/* LEFT PANEL */}
-        <div className="panel left-panel">
-          <div className="panel-header">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
-            </svg>
-            <span className="panel-title">Live Conversation</span>
+      {toastMessage && (
+        <div className="toast-container">
+          <div className="toast">
+            <div className="toast-title">Supervisor Alert</div>
+            <div className="toast-desc">{toastMessage}</div>
           </div>
-          
+        </div>
+      )}
+
+      <div className="panels-wrapper">
+        <div className="panel left-panel">
+          <div className="panel-header">Live Conversation</div>
           <div className="chat-container">
             {messages.length === 0 ? (
-              <div className="empty-state">
-                Select a scenario above or type a message below to start.
-              </div>
+              <div className="empty-state">Select a scenario above to start.</div>
             ) : (
               messages.map((msg, i) => (
                 <div key={i} className={`message ${msg.sender}`}>
-                  <div className="message-bubble">
-                    {msg.text}
-                  </div>
-                  <div className="message-meta">
-                    {msg.sender === 'agent' ? 'Support Agent' : 'Customer'} • {msg.timestamp}
-                  </div>
+                  <div className="message-bubble">{msg.text}</div>
+                  <div className="message-meta">{msg.sender === 'agent' ? 'Support Agent' : 'Customer'} • {msg.timestamp}</div>
                 </div>
               ))
             )}
             <div ref={chatEndRef} />
           </div>
-
           <div className="custom-input-section">
             <form onSubmit={handleCustomSubmit} className="custom-input-form">
-              <input 
-                type="text" 
-                className="custom-input" 
-                placeholder="Type custom customer message..." 
-                value={customInput}
-                onChange={(e) => setCustomInput(e.target.value)}
-              />
+              <input type="text" className="custom-input" placeholder="Type custom message..." value={customInput} onChange={(e) => setCustomInput(e.target.value)} />
               <button type="submit" className="send-btn">Send</button>
             </form>
           </div>
         </div>
 
-        {/* RIGHT PANEL */}
         <div className="panel right-panel">
-          <div className="panel-header">
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="var(--text-secondary)" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-              <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-              <line x1="3" y1="9" x2="21" y2="9"></line>
-              <line x1="9" y1="21" x2="9" y2="9"></line>
-            </svg>
-            <span className="panel-title">Agent Dashboard</span>
-          </div>
-
+          <div className="panel-header">Agent Dashboard</div>
           <div className="dashboard-content">
-            
             <div className="risk-section">
               <div className="section-title">Manipulation Risk Score</div>
-              <div className="risk-score-text" style={{ color: getRiskColor(displayedScore) }}>
-                {displayedScore}%
-              </div>
+              <div className="risk-score-text" style={{ color: getRiskColor(displayedScore) }}>{displayedScore}%</div>
               <div className="risk-gauge-container">
-                <div 
-                  className="risk-gauge-bar" 
-                  style={{ 
-                    width: `${displayedScore}%`, 
-                    backgroundColor: getRiskColor(displayedScore) 
-                  }} 
-                />
+                <div className="risk-gauge-bar" style={{ width: `${displayedScore}%`, backgroundColor: getRiskColor(displayedScore) }} />
               </div>
             </div>
-
             <div className="signals-section">
-              <div className="section-title">Signals Detected</div>
+              <div className="section-title">Signals Detected (Live WS)</div>
               <div className="signals-list">
-                {activeSignals.length === 0 && (
-                  <div style={{ color: 'var(--text-secondary)', fontStyle: 'italic', fontSize: '0.9rem' }}>
-                    Monitoring for manipulation vectors...
-                  </div>
-                )}
+                {activeSignals.length === 0 && <div className="empty-state">Monitoring...</div>}
                 {activeSignals.map((sig, i) => (
                   <div key={i} className="signal-item">
-                    <div className="signal-icon" style={{ backgroundColor: `${sig.color}33`, color: sig.color }}>
-                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-                        <polygon points="12 2 22 22 2 22"></polygon>
-                      </svg>
-                    </div>
+                    <div className="signal-icon" style={{ backgroundColor: `${sig.color}33`, color: sig.color }}>⚠</div>
                     {sig.text}
                   </div>
                 ))}
               </div>
             </div>
-
             <div className="action-section">
-              <button 
-                onClick={handleOverrideClick}
-                className={`override-btn ${overrideStatus}`} 
-              >
-                {overrideStatus === 'approved' ? (
-                  <>
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      <polyline points="20 6 9 17 4 12"></polyline>
-                    </svg>
-                    Action Approved
-                  </>
-                ) : (
-                  <>
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                      {overrideStatus === 'locked' || overrideStatus === 'error' ? (
-                        <>
-                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-                          <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
-                        </>
-                      ) : (
-                        <>
-                          <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
-                          <path d="M7 11V7a5 5 0 0 1 9.9-1"></path>
-                        </>
-                      )}
-                    </svg>
-                    Override Account Limit
-                  </>
-                )}
-              </button>
-              <div className={`btn-tooltip ${overrideStatus === 'locked' || overrideStatus === 'error' ? 'locked' : ''}`}>
-                {overrideStatus === 'locked' || overrideStatus === 'error'
-                  ? "Blocked: high manipulation risk — supervisor notified" 
-                  : overrideStatus === 'approved' 
-                    ? "Override successful."
-                    : "Active: standard override available"}
-              </div>
+              <button className={`override-btn ${overrideStatus}`}>{overrideStatus === 'locked' ? 'Action Blocked' : 'Override Limit'}</button>
             </div>
-
           </div>
         </div>
       </div>
     </div>
+  );
+}
+
+// =======================
+// SUPERVISOR VIEW
+// =======================
+function SupervisorView() {
+  const { id } = useParams();
+  const [history, setHistory] = useState(null);
+
+  useEffect(() => {
+    fetch(`${API_URL}/conversation/${id}/history`)
+      .then(r => r.json())
+      .then(data => setHistory(data))
+      .catch(e => console.error(e));
+  }, [id]);
+
+  if (!history) return <div className="app-container"><div className="empty-state">Loading history...</div></div>;
+
+  return (
+    <div className="app-container" style={{ display: 'block', overflow: 'auto' }}>
+      <div className="control-panel" style={{ marginBottom: '1.5rem' }}>
+        <Link to="/" className="control-btn">← Back to Dashboard</Link>
+        <span className="panel-title">Supervisor Trail: {id}</span>
+      </div>
+
+      <div className="panels-wrapper" style={{ flexDirection: 'column' }}>
+        <div className="panel" style={{ padding: '2rem' }}>
+          <h2 style={{ marginBottom: '1rem' }}>Risk Event Timeline</h2>
+          {history.risk_events.length === 0 ? (
+            <div className="empty-state">No risk events logged for this session.</div>
+          ) : (
+            history.risk_events.map((evt, i) => (
+              <div key={i} style={{ padding: '1rem', border: '1px solid var(--panel-border)', borderRadius: '8px', marginBottom: '1rem', background: 'rgba(255,255,255,0.02)' }}>
+                <div style={{ color: 'var(--text-secondary)', fontSize: '0.85rem' }}>{new Date(evt.timestamp).toLocaleString()}</div>
+                <div style={{ fontSize: '1.2rem', fontWeight: 'bold', color: evt.action === 'block' ? 'var(--accent-red)' : 'var(--accent-amber)' }}>
+                  Action: {evt.action.toUpperCase()} (Score: {evt.score})
+                </div>
+                <div style={{ marginTop: '0.5rem' }}><strong>Signals:</strong> {evt.signals.join(', ')}</div>
+                {evt.reasoning && <div style={{ marginTop: '0.5rem', fontStyle: 'italic', color: 'var(--accent-red)' }}>Reasoning: {evt.reasoning}</div>}
+              </div>
+            ))
+          )}
+        </div>
+
+        <div className="panel" style={{ padding: '2rem' }}>
+          <h2 style={{ marginBottom: '1rem' }}>Full Chat Transcript</h2>
+          {history.messages.map((msg, i) => (
+            <div key={i} style={{ marginBottom: '0.5rem' }}>
+              <strong>{msg.sender === 'agent' ? 'Agent' : 'Customer'}:</strong> {msg.text}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// =======================
+// MAIN APP
+// =======================
+function App() {
+  return (
+    <BrowserRouter>
+      <Routes>
+        <Route path="/" element={<Dashboard />} />
+        <Route path="/supervisor/:id" element={<SupervisorView />} />
+      </Routes>
+    </BrowserRouter>
   );
 }
 
